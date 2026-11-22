@@ -22,6 +22,15 @@ Address_t *my_address;
 Address_t** network = NULL;
 uint32_t peer_count = 0;
 
+/* signature = sha256(data || salt) */
+void get_signature(const char* data, size_t data_len,
+    const char* salt, hashdata_t out)
+{
+  char buf[SHA256_HASH_SIZE + SALT_LEN];
+  memcpy(buf, data, data_len);
+  memcpy(buf + data_len, salt, SALT_LEN);
+  get_data_sha(buf, out, data_len + SALT_LEN, SHA256_HASH_SIZE);
+}
 /*
  * Send a request message to another peer on the network. Unless this is 
  * specifically an 'inform' message as described in the assignment handout, a 
