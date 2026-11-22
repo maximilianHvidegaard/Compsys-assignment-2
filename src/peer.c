@@ -21,7 +21,24 @@ Address_t *my_address;
 
 Address_t** network = NULL;
 uint32_t peer_count = 0;
-
+pthread_mutex_t network_lock = PTHREAD_MUTEX_INITIALIZER;
+/* Adds per to the network unless ip+port is already known.
+ * Returns 1 if added, 0 if it was a duplicate. Thread-safe. */
+ind add_peer_if_new(Address_t* peer)
+{
+  pthread_mutex_lock(&network_lock);
+  for (uint32_t i = 0; i < peer_count; i++) {
+    if (network[i]->port == peer->port &&
+        strncmp(network[i]->ip, peer->ip, IP_LEN) == 0){
+      pthread_mutex_unlock(&network_lock);
+      return 0;
+    }
+  }
+network = realloc(network, (peer_count + 1) * sizeof(Address_t*));
+network[peer_count++] = peer;
+pthread_mutex_unlock(&network_lock);
+return 1;
+}
 /* signature = sha256(data || salt) */
 void get_signature(const char* data, size_t data_len,
     const char* salt, hashdata_t out)
