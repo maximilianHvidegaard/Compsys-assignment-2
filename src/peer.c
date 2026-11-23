@@ -519,9 +519,20 @@ void* handle_server_request_thread(void *vargp)
                 printf("Registered new peer: %s:%u\n",
                     new_peer->ip, new_peer->port);
             } else {
+                uint32_t auth_status = check_peer_signature(&header);
+
+                free(new_peer);
+
+                if (auth_status != STATUS_OK) {
+                    const char error[] = "Password mismatch";
+
+                    send_one_block_reply(connfd, STATUS_BAD_PASSWORD,
+                                        error, strlen(error));
+                    break;
+                }
+
                 printf("Peer already registered\n");
                 status = STATUS_PEER_EXISTS;
-                free(new_peer);
             }
 
             // Create the response body
