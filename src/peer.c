@@ -83,7 +83,16 @@ void send_message(Address_t peer_address, int command,
     memcpy(msg_buf, &request_header, REQUEST_HEADER_LEN);
     memcpy(msg_buf+REQUEST_HEADER_LEN, request_body, body_length);
     compsys_helper_writen(peer_socket, msg_buf, REQUEST_HEADER_LEN+body_length);
-
+ 
+    ReplyHeader_t reply_header;
+    compsys_helper_readnb(&state, &request_header, REPLY_HEADER_LEN);
+    
+    uint32_t reply_length = ntohl(reply_header.length);
+    uint32_t reply_status = ntohl(reply_header.status);
+    uint32_t reply_block = ntohl(reply_header.this_block);
+    uint32_t reply_block_count = ntohl(reply_header.block_count);
+    
+    printf("Got reply: Status %u, length %u, block %u of %u\n", reply_status, reply_length, reply_block, reply_block_count);
     /*
     3: Handing the response to the register message
     Rather than closing immediately we should probably handle a response.
