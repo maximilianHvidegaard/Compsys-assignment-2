@@ -246,6 +246,57 @@ int send_one_block_reply(int connfd, uint32_t status,
 
 
 
+static uint32_t check_peer_signature(const RequestHeader_t *header)
+{
+    uint32_t status = STATUS_PEER_MISSING;
+    uint32_t sender_port = ntohl(header->port);
+
+    pthread_mutex_lock(&network_lock);
+
+    for (uint32_t i = 0; i < peer_count; i++) {
+        Address_t *peer = network[i];
+
+        // Find the sender using IP and port
+        if (peer->port != sender_port ||
+            strncmp(peer->ip, header->ip, IP_LEN) != 0) {
+            continue;
+        }
+
+        const char *salt = peer->salt;
+        const uint8_t *stored_signature = peer->signature;
+
+        // Our own peer stores its network signature separately
+        if (peer == my_address) {
+            if (!my_network_ready) {
+                status = STATUS_BAD_PASSWORD;
+                break;
+            }
+
+            salt = my_network_salt;
+            stored_signature = my_network_signature;
+        }
+
+        // Hash the received signature using the stored salt
+        hashdata_t computed_signature;
+
+        get_signature((const char *)header->signature,
+                      SHA256_HASH_SIZE,
+                      salt,
+                      computed_signature);
+
+        // Compare with the stored network signature
+        status = memcmp(computed_signature, stored_signature,
+                        SHA256_HASH_SIZE) == 0
+                 ? STATUS_OK : STATUS_BAD_PASSWORD;
+        break;
+    }
+
+    pthread_mutex_unlock(&network_lock);
+    return status;
+}
+
+
+
 /* Send a large file in multiple blocks */
 static int send_file_blocks(int connfd, FILE *file)
 {
@@ -544,6 +595,20 @@ void* handle_server_request_thread(void *vargp)
 
         
         case COMMAND_RETREIVE: {
+
+            // Check that the requesting peer is registered
+            uint32_t auth_status = check_peer_signature(&header);
+
+            if (auth_status != STATUS_OK) {
+                const char *error = auth_status == STATUS_PEER_MISSING
+                    ? "Peer not registered"
+                    : "Incorrect signature";
+
+                send_one_block_reply(connfd, auth_status,
+                                    error, (uint32_t)strlen(error));
+                break;
+            }
+
             // Check that the filename is valid
             if (body_length == 0 || body_length > PATH_LEN ||
                 memchr(buf, '\0', body_length) != NULL) {
