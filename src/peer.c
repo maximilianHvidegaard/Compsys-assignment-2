@@ -139,6 +139,55 @@ void* client_thread()
     return NULL;
 }
 
+
+int send_one_block_reply(int connfd, uint32_t status,
+                         const char *body, uint32_t body_length)
+{
+    // Check the maximum message size
+    if (body_length > MAX_MSG_LEN - REPLY_HEADER_LEN ||
+        (body_length > 0 && body == NULL)) {
+        return 0;
+    }
+
+    ReplyHeader_t reply = {0};
+
+    reply.length = htonl(body_length);
+    reply.status = htonl(status);
+    reply.this_block = htonl(0);
+    reply.block_count = htonl(1);
+
+    // Calculate the SHA-256 hash of the body
+    get_data_sha(body != NULL ? body : "",
+                 reply.block_hash,
+                 body_length, SHA256_HASH_SIZE);
+
+    // For a single block, both hashes are identical
+    memcpy(reply.total_hash, reply.block_hash,
+           SHA256_HASH_SIZE);
+
+    // Combine header and body
+    char message[MAX_MSG_LEN];
+
+    memcpy(message, &reply, REPLY_HEADER_LEN);
+
+    if (body_length > 0) {
+        memcpy(message + REPLY_HEADER_LEN, body, body_length);
+    }
+
+    // Send the complete response
+    size_t message_length = REPLY_HEADER_LEN + body_length;
+
+    if (compsys_helper_writen(connfd, message, message_length)
+        != (ssize_t)message_length) {
+        perror("Failed to send response");
+        return 0;
+    }
+
+    return 1;
+}
+
+
+
 /*
  * Handler for all server requests. This will call the relevent function based 
  * on the parsed command code
@@ -216,6 +265,9 @@ void* handle_server_request_thread(void *vargp)
         case COMMAND_REGISTER:
             if (body_length != 0) {
                 printf("Invalid REGISTER request\n");
+                const char error[] = "REGISTER must have an empty body";
+                send_one_block_reply(connfd, STATUS_MALFORMED,
+                     error, strlen(error));
                 break;
             }
 
@@ -253,13 +305,73 @@ void* handle_server_request_thread(void *vargp)
             );
 
             // Add the peer if it does not already exist
+            uint32_t status = STATUS_OK;
+
             if (add_peer_if_new(new_peer)) {
                 printf("Registered new peer: %s:%u\n",
                     new_peer->ip, new_peer->port);
             } else {
                 printf("Peer already registered\n");
+                status = STATUS_PEER_EXISTS;
                 free(new_peer);
             }
+
+            // Create the response body
+            char reply_body[MAX_MSG_LEN - REPLY_HEADER_LEN];
+            uint32_t reply_length = 0;
+            int too_many_peers = 0;
+
+            // Protect the shared network list
+            pthread_mutex_lock(&network_lock);
+
+            for (uint32_t i = 0; i < peer_count; i++) {
+                Address_t *peer = network[i];
+
+                // Our own address has not received a network signature
+                if (peer == my_address) {
+                    continue;
+                }
+
+                // Check that the peer fits in one response block
+                if (reply_length + PEER_ADDR_LEN > sizeof(reply_body)) {
+                    too_many_peers = 1;
+                    break;
+                }
+
+                // IP address (16 bytes)
+                memcpy(reply_body + reply_length, peer->ip, IP_LEN);
+                reply_length += IP_LEN;
+
+                // Port in network byte order (4 bytes)
+                uint32_t network_port = htonl(peer->port);
+                memcpy(reply_body + reply_length, &network_port, PORT_LEN);
+                reply_length += PORT_LEN;
+
+                // Network signature (32 bytes)
+                memcpy(reply_body + reply_length,
+                    peer->signature, SHA256_HASH_SIZE);
+                reply_length += SHA256_HASH_SIZE;
+
+                // Network salt (16 bytes)
+                memcpy(reply_body + reply_length, peer->salt, SALT_LEN);
+                reply_length += SALT_LEN;
+            }
+
+            pthread_mutex_unlock(&network_lock);
+
+            // Send the response
+            if (too_many_peers) {
+                const char error[] = "Peer list too large";
+                send_one_block_reply(connfd, STATUS_OTHER,
+                                    error, strlen(error));
+            } else {
+                send_one_block_reply(connfd, status,
+                                    reply_body, reply_length);
+
+                printf("Sent REGISTER response: %u bytes\n",
+                    reply_length);
+            }
+
 
             break;
 
