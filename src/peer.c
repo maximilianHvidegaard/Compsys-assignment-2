@@ -728,9 +728,20 @@ void* handle_server_request_thread(void *vargp)
             break;
         }
 
-        default:
+        default: {
             printf("Unknown command: %u\n", command);
+
+            const char error[] = "Unknown command";
+
+            send_one_block_reply(
+                connfd,
+                STATUS_MALFORMED,
+                error,
+                strlen(error)
+            );
+
             break;
+        }
     }
 
 
