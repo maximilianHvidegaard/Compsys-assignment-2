@@ -24,7 +24,7 @@ uint32_t peer_count = 0;
 pthread_mutex_t network_lock = PTHREAD_MUTEX_INITIALIZER;
 /* Adds per to the network unless ip+port is already known.
  * Returns 1 if added, 0 if it was a duplicate. Thread-safe. */
-ind add_peer_if_new(Address_t* peer)
+int add_peer_if_new(Address_t* peer)
 {
   pthread_mutex_lock(&network_lock);
   for (uint32_t i = 0; i < peer_count; i++) {
