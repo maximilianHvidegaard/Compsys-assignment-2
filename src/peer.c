@@ -246,6 +246,90 @@ int send_one_block_reply(int connfd, uint32_t status,
 
 
 
+/* Send a large file in multiple blocks */
+static int send_file_blocks(int connfd, FILE *file)
+{
+    const uint32_t max_body = MAX_MSG_LEN - REPLY_HEADER_LEN;
+    char message[MAX_MSG_LEN];
+    char *data = message + REPLY_HEADER_LEN;
+
+    // Find the file size
+    if (fseek(file, 0, SEEK_END) != 0) return 0;
+
+    long file_size = ftell(file);
+    if (file_size < 0) return 0;
+
+    rewind(file);
+
+    // Calculate the number of blocks
+    uint64_t blocks = (uint64_t)file_size / max_body;
+
+    if ((uint64_t)file_size % max_body != 0) {
+        blocks++;
+    }
+
+    if (blocks == 0 || blocks > UINT32_MAX) return 0;
+
+    // Calculate the hash of the entire file
+    SHA256_CTX sha;
+    hashdata_t total_hash;
+
+    sha256_init(&sha);
+
+    size_t n;
+    while ((n = fread(data, 1, max_body, file)) > 0) {
+        sha256_update(&sha, data, (uint32_t)n);
+    }
+
+    if (ferror(file)) return 0;
+
+    sha256_final(&sha, total_hash);
+    rewind(file);
+
+    // Send each block
+    long remaining = file_size;
+
+    for (uint32_t i = 0; i < (uint32_t)blocks; i++) {
+        uint32_t length = remaining > max_body
+            ? max_body : (uint32_t)remaining;
+
+        if (fread(data, 1, length, file) != length) {
+            return 0;
+        }
+
+        ReplyHeader_t reply = {0};
+
+        reply.length = htonl(length);
+        reply.status = htonl(STATUS_OK);
+        reply.this_block = htonl(i);
+        reply.block_count = htonl((uint32_t)blocks);
+
+        // Calculate this block's hash
+        get_data_sha(data, reply.block_hash,
+                     length, SHA256_HASH_SIZE);
+
+        // Copy the hash of the entire file
+        memcpy(reply.total_hash, total_hash,
+               SHA256_HASH_SIZE);
+
+        memcpy(message, &reply, REPLY_HEADER_LEN);
+
+        size_t message_length = REPLY_HEADER_LEN + length;
+
+        if (compsys_helper_writen(connfd, message,
+                                  message_length)
+            != (ssize_t)message_length) {
+            return 0;
+        }
+
+        remaining -= length;
+    }
+
+    return 1;
+}
+
+
+
 /*
  * Handler for all server requests. This will call the relevent function based 
  * on the parsed command code
@@ -458,14 +542,74 @@ void* handle_server_request_thread(void *vargp)
 }
             break;
 
-        case COMMAND_RETREIVE:
-            if (body_length == 0) {
-                printf("Invalid RETRIEVE request\n");
-            } else {
-                printf("RETRIEVE request for: %.*s\n",
-                       (int)body_length, buf);
+        
+        case COMMAND_RETREIVE: {
+            // Check that the filename is valid
+            if (body_length == 0 || body_length > PATH_LEN ||
+                memchr(buf, '\0', body_length) != NULL) {
+                const char error[] = "Invalid filename";
+                send_one_block_reply(connfd, STATUS_MALFORMED,
+                                    error, strlen(error));
+                break;
             }
+
+            // Copy the filename and add a null terminator
+            char filename[PATH_LEN + 1];
+            memcpy(filename, buf, body_length);
+            filename[body_length] = '\0';
+
+            // Only allow files in the current directory
+            if (strchr(filename, '/') != NULL ||
+                strchr(filename, '\\') != NULL) {
+                const char error[] = "File must be in the current directory";
+                send_one_block_reply(connfd, STATUS_BAD_REQUEST,
+                                    error, strlen(error));
+                break;
+            }
+
+            // Open the requested file
+            FILE *file = fopen(filename, "rb");
+
+            if (file == NULL) {
+                const char error[] = "File not found";
+                send_one_block_reply(connfd, STATUS_BAD_REQUEST,
+                                    error, strlen(error));
+                break;
+            }
+
+            
+            // Read one block plus one byte
+            char data[MAX_MSG_LEN - REPLY_HEADER_LEN + 1];
+
+            size_t bytes = fread(data, 1, sizeof(data), file);
+            int read_failed = ferror(file);
+
+            if (read_failed) {
+                const char error[] = "Cannot read file";
+                send_one_block_reply(connfd, STATUS_OTHER,
+                                    error, strlen(error));
+            } else if (bytes > MAX_MSG_LEN - REPLY_HEADER_LEN) {
+                // Large file: send multiple blocks
+                if (send_file_blocks(connfd, file)) {
+                    printf("Sent large file %s\n", filename);
+                } else {
+                    fprintf(stderr, "Could not send file %s\n",
+                            filename);
+                }
+            } else {
+                // Small file: send one block
+                send_one_block_reply(connfd, STATUS_OK,
+                                    data, (uint32_t)bytes);
+
+                printf("Sent file %s (%zu bytes)\n",
+                    filename, bytes);
+            }
+
+            fclose(file);
             break;
+        }
+
+
 
         case COMMAND_INFORM: {
             if (body_length != PEER_ADDR_LEN) {
