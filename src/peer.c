@@ -1,6 +1,6 @@
+#include "common.h"
 #include <stdlib.h>
 #include <stdio.h>
-#include <math.h>
 #include <netdb.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
@@ -132,7 +132,7 @@ void* client_thread()
     Here you should probably send a first register message using the 
     send_message function.
     */
-
+    send_message(peer_address,COMMAND_REGISTER,NULL, 0);
     // You should never see this printed in your finished implementation
     printf("Client thread done\n");
 
@@ -234,6 +234,7 @@ int main(int argc, char **argv)
     char user_salt[SALT_LEN+1] = "0123456789ABCDEF\0";
     //generate_random_salt(user_salt);
     memcpy(my_address->salt, user_salt, SALT_LEN);
+    get_signature(password, strlen(password), user_salt, my_address->signature);
 
     /* 
     1: Setting Up
