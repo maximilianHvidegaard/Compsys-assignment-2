@@ -433,6 +433,14 @@ void* handle_server_request_thread(void *vargp)
     // Check that the body is not too large
     if (body_length > MAX_MSG_LEN - REQUEST_HEADER_LEN) {
         printf("Request body is too large\n");
+
+        if (command != COMMAND_INFORM) {
+            const char error[] = "Request body too large";
+
+            send_one_block_reply(connfd, STATUS_MALFORMED,
+                                error, (uint32_t)strlen(error));
+        }
+
         close(connfd);
         return NULL;
     }
@@ -479,12 +487,19 @@ void* handle_server_request_thread(void *vargp)
 
             // Check the address
             if (!is_valid_ip(new_peer->ip) ||
-                new_peer->port == 0 ||
-                !is_valid_port(new_peer->port)) {
-                printf("Invalid peer address\n");
-                free(new_peer);
-                break;
-            }
+            new_peer->port == 0 ||
+            !is_valid_port(new_peer->port)) {
+
+            printf("Invalid peer address\n");
+
+            const char error[] = "Invalid peer address";
+
+            send_one_block_reply(connfd, STATUS_MALFORMED,
+                                error, (uint32_t)strlen(error));
+
+            free(new_peer);
+            break;
+        }
 
             // Generate a network salt
             generate_random_salt(new_peer->salt);
