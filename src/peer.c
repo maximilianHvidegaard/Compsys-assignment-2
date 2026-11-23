@@ -22,6 +22,9 @@ Address_t *my_address;
 Address_t** network = NULL;
 uint32_t peer_count = 0;
 pthread_mutex_t network_lock = PTHREAD_MUTEX_INITIALIZER;
+hashdata_t my_network_signature;
+char my_network_salt[SALT_LEN];
+int my_network_ready = 0;
 /* Adds per to the network unless ip+port is already known.
  * Returns 1 if added, 0 if it was a duplicate. Thread-safe. */
 int add_peer_if_new(Address_t* peer)
@@ -91,6 +94,61 @@ void send_message(Address_t peer_address, int command,
 
     close(peer_socket);
 }
+
+
+void inform_other_peers(Address_t *new_peer)
+{
+    // Build the 68-byte INFORM body
+    char body[PEER_ADDR_LEN];
+
+    memcpy(body, new_peer->ip, IP_LEN);
+
+    uint32_t port = htonl(new_peer->port);
+    memcpy(body + IP_LEN, &port, PORT_LEN);
+
+    memcpy(body + IP_LEN + PORT_LEN,
+           new_peer->signature, SHA256_HASH_SIZE);
+
+    memcpy(body + IP_LEN + PORT_LEN + SHA256_HASH_SIZE,
+           new_peer->salt, SALT_LEN);
+
+    // Copy the addresses while holding the mutex
+    pthread_mutex_lock(&network_lock);
+
+    Address_t *recipients = malloc(
+        peer_count * sizeof(Address_t)
+    );
+
+    uint32_t count = 0;
+
+    if (recipients != NULL) {
+        for (uint32_t i = 0; i < peer_count; i++) {
+            if (network[i] != my_address &&
+                network[i] != new_peer) {
+                recipients[count++] = *network[i];
+            }
+        }
+    }
+
+    pthread_mutex_unlock(&network_lock);
+
+    if (recipients == NULL) {
+        perror("malloc failed");
+        return;
+    }
+
+    // Send INFORM to all existing peers
+    for (uint32_t i = 0; i < count; i++) {
+        printf("Informing peer %s:%u\n",
+               recipients[i].ip, recipients[i].port);
+
+        send_message(recipients[i], COMMAND_INFORM,
+                     body, PEER_ADDR_LEN);
+    }
+
+    free(recipients);
+}
+
 
 /*
  * Function to act as thread for all required client interactions. This thread 
@@ -324,13 +382,23 @@ void* handle_server_request_thread(void *vargp)
             // Protect the shared network list
             pthread_mutex_lock(&network_lock);
 
+            // Create our own network signature once
+            if (!my_network_ready) {
+                generate_random_salt(my_network_salt);
+
+                get_signature(
+                    (const char *)my_address->signature,
+                    SHA256_HASH_SIZE,
+                    my_network_salt,
+                    my_network_signature
+                );
+
+                my_network_ready = 1;
+            }
+
             for (uint32_t i = 0; i < peer_count; i++) {
                 Address_t *peer = network[i];
 
-                // Our own address has not received a network signature
-                if (peer == my_address) {
-                    continue;
-                }
 
                 // Check that the peer fits in one response block
                 if (reply_length + PEER_ADDR_LEN > sizeof(reply_body)) {
@@ -347,14 +415,26 @@ void* handle_server_request_thread(void *vargp)
                 memcpy(reply_body + reply_length, &network_port, PORT_LEN);
                 reply_length += PORT_LEN;
 
-                // Network signature (32 bytes)
-                memcpy(reply_body + reply_length,
-                    peer->signature, SHA256_HASH_SIZE);
-                reply_length += SHA256_HASH_SIZE;
+                
+                if (peer == my_address) {
+                    // Use our separately stored network signature
+                    memcpy(reply_body + reply_length,
+                        my_network_signature, SHA256_HASH_SIZE);
+                    reply_length += SHA256_HASH_SIZE;
 
-                // Network salt (16 bytes)
-                memcpy(reply_body + reply_length, peer->salt, SALT_LEN);
-                reply_length += SALT_LEN;
+                    memcpy(reply_body + reply_length,
+                        my_network_salt, SALT_LEN);
+                    reply_length += SALT_LEN;
+                } else {
+                    memcpy(reply_body + reply_length,
+                        peer->signature, SHA256_HASH_SIZE);
+                    reply_length += SHA256_HASH_SIZE;
+
+                    memcpy(reply_body + reply_length,
+                        peer->salt, SALT_LEN);
+                    reply_length += SALT_LEN;
+                }
+
             }
 
             pthread_mutex_unlock(&network_lock);
@@ -372,7 +452,10 @@ void* handle_server_request_thread(void *vargp)
                     reply_length);
             }
 
-
+            // Inform existing peers when a new peer joins
+            if (status == STATUS_OK) {
+                inform_other_peers(new_peer);
+}
             break;
 
         case COMMAND_RETREIVE:
@@ -384,13 +467,57 @@ void* handle_server_request_thread(void *vargp)
             }
             break;
 
-        case COMMAND_INFORM:
+        case COMMAND_INFORM: {
             if (body_length != PEER_ADDR_LEN) {
                 printf("Invalid INFORM request\n");
-            } else {
-                printf("INFORM request received\n");
+                break;
             }
+
+            // Allocate memory for the informed peer
+            Address_t *informed_peer = malloc(sizeof(Address_t));
+
+            if (informed_peer == NULL) {
+                perror("malloc failed");
+                break;
+            }
+
+            // Read IP address
+            memcpy(informed_peer->ip, buf, IP_LEN);
+            informed_peer->ip[IP_LEN - 1] = '\0';
+
+            // Read port in network byte order
+            uint32_t network_port;
+            memcpy(&network_port, buf + IP_LEN, PORT_LEN);
+            informed_peer->port = ntohl(network_port);
+
+            // Read network signature and salt
+            memcpy(informed_peer->signature,
+                buf + IP_LEN + PORT_LEN,
+                SHA256_HASH_SIZE);
+
+            memcpy(informed_peer->salt,
+                buf + IP_LEN + PORT_LEN + SHA256_HASH_SIZE,
+                SALT_LEN);
+
+            // Validate the address
+            if (!is_valid_ip(informed_peer->ip) ||
+                !is_valid_port(informed_peer->port)) {
+                printf("Invalid informed peer address\n");
+                free(informed_peer);
+                break;
+            }
+
+            // Add the peer to our network list
+            if (add_peer_if_new(informed_peer)) {
+                printf("INFORM: Added peer %s:%u\n",
+                    informed_peer->ip, informed_peer->port);
+            } else {
+                printf("INFORM: Peer already known\n");
+                free(informed_peer);
+            }
+
             break;
+        }
 
         default:
             printf("Unknown command: %u\n", command);
