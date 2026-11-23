@@ -143,24 +143,154 @@ void* client_thread()
  * Handler for all server requests. This will call the relevent function based 
  * on the parsed command code
  */
+
 void* handle_server_request_thread(void *vargp)
 {
     char buf[MAXLINE];
     compsys_helper_state_t state;
 
     int connfd = *((int *)vargp);
-    pthread_detach(pthread_self()); 
+    pthread_detach(pthread_self());
     free(vargp);
-
-    close(connfd);
 
     /*
     5: Reading Server Requests
-    Here we should probable actually read in some input data.
     */
 
+    // Initialize the provided reading helper
+    compsys_helper_readinitb(&state, connfd);
+
+    // Read the request header
+    ssize_t bytes_read = compsys_helper_readnb(
+        &state, buf, REQUEST_HEADER_LEN
+    );
+
+    if (bytes_read != REQUEST_HEADER_LEN) {
+        printf("Failed to read request header\n");
+        close(connfd);
+        return NULL;
+    }
+
+    // Copy the received bytes into the provided struct
+    RequestHeader_t header;
+    memcpy(&header, buf, REQUEST_HEADER_LEN);
+
+    // Convert values from network byte order
+    uint32_t port = ntohl(header.port);
+    uint32_t command = ntohl(header.command);
+    uint32_t body_length = ntohl(header.length);
+
+    // Print the received request
+    printf("Request received:\n");
+    printf("IP: %.*s\n", IP_LEN, header.ip);
+    printf("Port: %u\n", port);
+    printf("Command: %u\n", command);
+    printf("Body length: %u\n", body_length);
+
+
+    // Check that the body is not too large
+    if (body_length > MAX_MSG_LEN - REQUEST_HEADER_LEN) {
+        printf("Request body is too large\n");
+        close(connfd);
+        return NULL;
+    }
+
+    // Read the request body if it exists
+    if (body_length > 0) {
+        ssize_t body_read = compsys_helper_readnb(
+            &state, buf, body_length
+        );
+
+        if (body_read != (ssize_t)body_length) {
+            printf("Failed to read request body\n");
+            close(connfd);
+            return NULL;
+        }
+    }
+
+    printf("Received body of %u bytes\n", body_length);
+
+    
+    // Check which command was received
+    switch (command) {
+        case COMMAND_REGISTER:
+            if (body_length != 0) {
+                printf("Invalid REGISTER request\n");
+                break;
+            }
+
+            // Allocate memory for the new peer
+            Address_t *new_peer = malloc(sizeof(Address_t));
+
+            if (new_peer == NULL) {
+                perror("malloc failed");
+                break;
+            }
+
+            // Copy IP and port from the request header
+            memcpy(new_peer->ip, header.ip, IP_LEN);
+            new_peer->ip[IP_LEN - 1] = '\0';
+            new_peer->port = port;
+
+            // Check the address
+            if (!is_valid_ip(new_peer->ip) ||
+                new_peer->port == 0 ||
+                !is_valid_port(new_peer->port)) {
+                printf("Invalid peer address\n");
+                free(new_peer);
+                break;
+            }
+
+            // Generate a network salt
+            generate_random_salt(new_peer->salt);
+
+            // Hash the received signature with the network salt
+            get_signature(
+                (const char *)header.signature,
+                SHA256_HASH_SIZE,
+                new_peer->salt,
+                new_peer->signature
+            );
+
+            // Add the peer if it does not already exist
+            if (add_peer_if_new(new_peer)) {
+                printf("Registered new peer: %s:%u\n",
+                    new_peer->ip, new_peer->port);
+            } else {
+                printf("Peer already registered\n");
+                free(new_peer);
+            }
+
+            break;
+
+        case COMMAND_RETREIVE:
+            if (body_length == 0) {
+                printf("Invalid RETRIEVE request\n");
+            } else {
+                printf("RETRIEVE request for: %.*s\n",
+                       (int)body_length, buf);
+            }
+            break;
+
+        case COMMAND_INFORM:
+            if (body_length != PEER_ADDR_LEN) {
+                printf("Invalid INFORM request\n");
+            } else {
+                printf("INFORM request received\n");
+            }
+            break;
+
+        default:
+            printf("Unknown command: %u\n", command);
+            break;
+    }
+
+
+
+    close(connfd);
     return NULL;
 }
+
 
 /*
  * Function to act as basis for running the server thread. This thread will be
@@ -185,6 +315,46 @@ void* server_thread()
     connections. The function 'handle_server_request_thread' has been provided
     as a simple skeleton function you could use to process your requests in.
     */
+
+    while (1) {
+    // Wait for an incoming connection
+        int connfd = accept(listenfd, NULL, NULL);
+
+        if (connfd < 0) {
+            perror("accept failed");
+            continue;
+        }
+
+        printf("New connection accepted\n");
+
+        // Allocate memory for the connection descriptor
+        int *connfd_ptr = malloc(sizeof(int));
+
+        if (connfd_ptr == NULL) {
+            perror("malloc failed");
+            close(connfd);
+            continue;
+        }
+
+        *connfd_ptr = connfd;
+
+        // Create a new thread to handle this connection
+        pthread_t thread_id;
+
+        int result = pthread_create(
+            &thread_id,
+            NULL,
+            handle_server_request_thread,
+            connfd_ptr
+        );
+
+        if (result != 0) {
+            fprintf(stderr, "pthread_create failed: %s\n",
+                    strerror(result));
+            close(connfd);
+            free(connfd_ptr);
+        }
+    }
 
     // You should never see this printed in your finished implementation
     printf("Server thread done\n");
