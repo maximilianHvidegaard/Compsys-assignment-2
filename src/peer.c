@@ -682,6 +682,15 @@ void* handle_server_request_thread(void *vargp)
                 break;
             }
 
+            // Check that the sender is registered
+            uint32_t auth_status = check_peer_signature(&header);
+
+            if (auth_status != STATUS_OK) {
+                printf("Rejected INFORM from %.*s:%u (status %u)\n",
+                    IP_LEN, header.ip, port, auth_status);
+                break;
+            }
+
             // Allocate memory for the informed peer
             Address_t *informed_peer = malloc(sizeof(Address_t));
 
