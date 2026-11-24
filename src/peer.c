@@ -22,15 +22,15 @@ Address_t *my_address;
 // Our network signature and salt, assigned by the peer we registered with.
 // Kept separate from my_address->signature, which is our USER signature and
 // is sent in every request header.
+// my_network_ready is 1 once these are set (either by the network on
+// register, or by us when we are the first peer). Guarded by network_lock.
 hashdata_t my_network_signature;
 char my_network_salt[SALT_LEN];
+int my_network_ready = 0;
 
 Address_t** network = NULL;
 uint32_t peer_count = 0;
 pthread_mutex_t network_lock = PTHREAD_MUTEX_INITIALIZER;
-hashdata_t my_network_signature;
-char my_network_salt[SALT_LEN];
-int my_network_ready = 0;
 /* Adds per to the network unless ip+port is already known.
  * Returns 1 if added, 0 if it was a duplicate. Thread-safe. */
 int add_peer_if_new(Address_t* peer)
@@ -92,6 +92,12 @@ void send_message(Address_t peer_address, int command,
     memcpy(msg_buf, &request_header, REQUEST_HEADER_LEN);
     memcpy(msg_buf+REQUEST_HEADER_LEN, request_body, body_length);
     compsys_helper_writen(peer_socket, msg_buf, REQUEST_HEADER_LEN+body_length);
+
+    // Inform is the only command that gets no reply, so we're done
+    if (command == COMMAND_INFORM) {
+        close(peer_socket);
+        return;
+    }
  
     ReplyHeader_t reply_header;
     compsys_helper_readnb(&state, &reply_header, REPLY_HEADER_LEN);
@@ -131,9 +137,14 @@ void send_message(Address_t peer_address, int command,
 
         if (entry->port == my_address->port &&
             strncmp(entry->ip, my_address->ip, IP_LEN) == 0) {
-          // It's us: keep our network-assigned signature and salt
+          // It's us: keep our network-assigned signature and salt. Take the
+          // lock, as the server thread reads these while answering requests,
+          // and mark them ready so the server won't invent a different one.
+          pthread_mutex_lock(&network_lock);
           memcpy(my_network_signature, entry->signature, SHA256_HASH_SIZE);
           memcpy(my_network_salt, entry->salt, SALT_LEN);
+          my_network_ready = 1;
+          pthread_mutex_unlock(&network_lock);
           free(entry);
         } else if (add_peer_if_new(entry) == 0) {
           // Already known
