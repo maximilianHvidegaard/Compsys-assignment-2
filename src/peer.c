@@ -381,10 +381,12 @@ void* client_thread()
     Address_t peer_address;
     memcpy(peer_address.ip, peer_ip, IP_LEN);
     peer_address.port = atoi(peer_port);
-
+    if(!is_valid_port(peer_address.port)) {
+      printf("Invalid port, not registered\n");
+    } else {
+      send_message(peer_address, COMMAND_REGISTER, NULL, 0);
+    }
     // Join the network via the given peer
-    send_message(peer_address, COMMAND_REGISTER, NULL, 0);
-
     // Repeatedly ask for a file and request it from a random other peer
     while (1) {
         char filename[PATH_LEN];
