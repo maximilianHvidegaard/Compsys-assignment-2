@@ -19,6 +19,12 @@
 // Global variables to be used by both the server and client side of the peer.
 Address_t *my_address;
 
+// Our network signature and salt, assigned by the peer we registered with.
+// Kept separate from my_address->signature, which is our USER signature and
+// is sent in every request header.
+hashdata_t my_network_signature;
+char my_network_salt[SALT_LEN];
+
 Address_t** network = NULL;
 uint32_t peer_count = 0;
 pthread_mutex_t network_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -85,7 +91,7 @@ void send_message(Address_t peer_address, int command,
     compsys_helper_writen(peer_socket, msg_buf, REQUEST_HEADER_LEN+body_length);
  
     ReplyHeader_t reply_header;
-    compsys_helper_readnb(&state, &request_header, REPLY_HEADER_LEN);
+    compsys_helper_readnb(&state, &reply_header, REPLY_HEADER_LEN);
     
     uint32_t reply_length = ntohl(reply_header.length);
     uint32_t reply_status = ntohl(reply_header.status);
@@ -93,10 +99,61 @@ void send_message(Address_t peer_address, int command,
     uint32_t reply_block_count = ntohl(reply_header.block_count);
     
     printf("Got reply: Status %u, length %u, block %u of %u\n", reply_status, reply_length, reply_block, reply_block_count);
-    /*
-    3: Handing the response to the register message
-    Rather than closing immediately we should probably handle a response.
-    */
+    
+    char reply_body[MAX_MSG_LEN];
+    
+    if (reply_length > MAX_MSG_LEN - REPLY_HEADER_LEN){
+      printf("Error: reply body too long (%u bytes)\n", reply_length);
+      close(peer_socket);
+      return;
+    }
+    compsys_helper_readnb(&state, reply_body, reply_length);
+
+    if (reply_status >= 3) {
+      // Error replies carry a text message (not NUL-terminated)
+      printf("Error from peer: %.*s\n", (int)reply_length, reply_body);
+    } else if (command == COMMAND_REGISTER) {
+      // Body is a list of 68-byte entries: ip(16) port(4) sig(32) salt(16)
+      uint32_t count = reply_length / PEER_ADDR_LEN;
+
+      for (uint32_t i = 0; i < count; i++) {
+        char* p = reply_body + i * PEER_ADDR_LEN;
+
+        Address_t* entry = malloc(sizeof(Address_t));
+        memcpy(entry->ip,        p + 0,  IP_LEN);
+        memcpy(&entry->port,     p + 16, 4);
+        entry->port = ntohl(entry->port);
+        memcpy(entry->signature, p + 20, SHA256_HASH_SIZE);
+        memcpy(entry->salt,      p + 52, SALT_LEN);
+
+        if (entry->port == my_address->port &&
+            strncmp(entry->ip, my_address->ip, IP_LEN) == 0) {
+          // It's us: keep our network-assigned signature and salt
+          memcpy(my_network_signature, entry->signature, SHA256_HASH_SIZE);
+          memcpy(my_network_salt, entry->salt, SALT_LEN);
+          free(entry);
+        } else if (add_peer_if_new(entry) == 0) {
+          // Already known
+          free(entry);
+        }
+      }
+
+      // The peer we registered with isn't in its own list, so add it ourselves
+      Address_t* contacted = malloc(sizeof(Address_t));
+      memset(contacted, 0, sizeof(Address_t));
+      memcpy(contacted->ip, peer_address.ip, IP_LEN);
+      contacted->port = peer_address.port;
+      if (add_peer_if_new(contacted) == 0) {
+        free(contacted);
+      }
+
+      // Debug: show the network we now know about
+      pthread_mutex_lock(&network_lock);
+      for (uint32_t i = 0; i < peer_count; i++) {
+        printf("Peer %u: %s:%u\n", i, network[i]->ip, network[i]->port);
+      }
+      pthread_mutex_unlock(&network_lock);
+    }
 
     close(peer_socket);
 }
