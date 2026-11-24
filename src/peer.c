@@ -65,6 +65,71 @@ void get_signature(const char* data, size_t data_len,
     get_data_sha(buf, out, data_len + SALT_LEN, SHA256_HASH_SIZE);
 }
 
+/* Convert raw bytes to Python's bytes representation */
+static size_t append_bytes_repr(char *out,
+                                const unsigned char *data,
+                                size_t len)
+{
+    const char hex[] = "0123456789abcdef";
+    char quote = '\'';
+
+    if (memchr(data, '\'', len) &&
+        !memchr(data, '"', len)) {
+        quote = '"';
+    }
+
+    size_t n = 0;
+
+    out[n++] = 'b';
+    out[n++] = quote;
+
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = data[i];
+
+        if (c == '\\' || c == (unsigned char)quote) {
+            out[n++] = '\\';
+            out[n++] = (char)c;
+        } else if (c == '\t' || c == '\n' || c == '\r') {
+            out[n++] = '\\';
+            out[n++] = c == '\t' ? 't' :
+                       c == '\n' ? 'n' : 'r';
+        } else if (c >= 32 && c <= 126) {
+            out[n++] = (char)c;
+        } else {
+            out[n++] = '\\';
+            out[n++] = 'x';
+            out[n++] = hex[c >> 4];
+            out[n++] = hex[c & 15];
+        }
+    }
+
+    out[n++] = quote;
+
+    return n;
+}
+
+/* Generate a Python-compatible network signature */
+static void get_network_signature(const char *signature,
+                                  const char *salt,
+                                  hashdata_t out)
+{
+    char buf[4 * (SHA256_HASH_SIZE + SALT_LEN) + 6];
+
+    size_t len = append_bytes_repr(
+        buf,
+        (const unsigned char *)signature,
+        SHA256_HASH_SIZE
+    );
+
+    len += append_bytes_repr(
+        buf + len,
+        (const unsigned char *)salt,
+        SALT_LEN
+    );
+
+    get_data_sha(buf, out, len, SHA256_HASH_SIZE);
+}
+
 /*
  * Handle the body of a successful register reply: a list of 68-byte entries
  * (ip 16, port 4, network signature 32, network salt 16). Our own entry gives
@@ -428,10 +493,11 @@ static uint32_t check_peer_signature(const RequestHeader_t *header)
         // Hash the received signature using the stored salt
         hashdata_t computed_signature;
 
-        get_signature((const char *)header->signature,
-                      SHA256_HASH_SIZE,
-                      salt,
-                      computed_signature);
+        get_network_signature(
+            (const char *)header->signature,
+            salt,
+            computed_signature
+        );
 
         // Compare with the stored network signature
         status = memcmp(computed_signature, stored_signature,
@@ -647,9 +713,8 @@ void* handle_server_request_thread(void *vargp)
             generate_random_salt(new_peer->salt);
 
             // Hash the received signature with the network salt
-            get_signature(
+            get_network_signature(
                 (const char *)header.signature,
-                SHA256_HASH_SIZE,
                 new_peer->salt,
                 new_peer->signature
             );
@@ -689,9 +754,8 @@ void* handle_server_request_thread(void *vargp)
             if (!my_network_ready) {
                 generate_random_salt(my_network_salt);
 
-                get_signature(
+                get_network_signature(
                     (const char *)my_address->signature,
-                    SHA256_HASH_SIZE,
                     my_network_salt,
                     my_network_signature
                 );
