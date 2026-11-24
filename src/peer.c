@@ -31,46 +31,135 @@ int my_network_ready = 0;
 Address_t** network = NULL;
 uint32_t peer_count = 0;
 pthread_mutex_t network_lock = PTHREAD_MUTEX_INITIALIZER;
-/* Adds per to the network unless ip+port is already known.
- * Returns 1 if added, 0 if it was a duplicate. Thread-safe. */
+
+/*
+ * Add a peer to the network unless its ip+port is already known.
+ * Returns 1 if added, 0 if it was a duplicate. Thread-safe.
+ */
 int add_peer_if_new(Address_t* peer)
 {
-  pthread_mutex_lock(&network_lock);
-  for (uint32_t i = 0; i < peer_count; i++) {
-    if (network[i]->port == peer->port &&
-        strncmp(network[i]->ip, peer->ip, IP_LEN) == 0){
-      pthread_mutex_unlock(&network_lock);
-      return 0;
+    pthread_mutex_lock(&network_lock);
+    for (uint32_t i = 0; i < peer_count; i++) {
+        if (network[i]->port == peer->port &&
+            strncmp(network[i]->ip, peer->ip, IP_LEN) == 0) {
+            pthread_mutex_unlock(&network_lock);
+            return 0;
+        }
     }
-  }
-network = realloc(network, (peer_count + 1) * sizeof(Address_t*));
-network[peer_count++] = peer;
-pthread_mutex_unlock(&network_lock);
-return 1;
+    network = realloc(network, (peer_count + 1) * sizeof(Address_t*));
+    network[peer_count++] = peer;
+    pthread_mutex_unlock(&network_lock);
+    return 1;
 }
-/* signature = sha256(data || salt) */
+
+/*
+ * Compute out = sha256(data || salt). Used both for our user signature
+ * (data = password) and for network signatures (data = user signature).
+ */
 void get_signature(const char* data, size_t data_len,
     const char* salt, hashdata_t out)
 {
-  char buf[SHA256_HASH_SIZE + SALT_LEN];
-  memcpy(buf, data, data_len);
-  memcpy(buf + data_len, salt, SALT_LEN);
-  get_data_sha(buf, out, data_len + SALT_LEN, SHA256_HASH_SIZE);
+    char buf[SHA256_HASH_SIZE + SALT_LEN];
+    memcpy(buf, data, data_len);
+    memcpy(buf + data_len, salt, SALT_LEN);
+    get_data_sha(buf, out, data_len + SALT_LEN, SHA256_HASH_SIZE);
 }
+
 /*
- * Send a request message to another peer on the network. Unless this is 
- * specifically an 'inform' message as described in the assignment handout, a 
+ * Handle the body of a successful register reply: a list of 68-byte entries
+ * (ip 16, port 4, network signature 32, network salt 16). Our own entry gives
+ * us our network signature; every other entry is added to the network.
+ */
+static void handle_register_reply(Address_t peer_address,
+    char* body, uint32_t length)
+{
+    uint32_t count = length / PEER_ADDR_LEN;
+
+    for (uint32_t i = 0; i < count; i++) {
+        char* p = body + i * PEER_ADDR_LEN;
+
+        Address_t* entry = malloc(sizeof(Address_t));
+        memcpy(entry->ip,        p + 0,  IP_LEN);
+        memcpy(&entry->port,     p + 16, PORT_LEN);
+        entry->port = ntohl(entry->port);
+        memcpy(entry->signature, p + 20, SHA256_HASH_SIZE);
+        memcpy(entry->salt,      p + 52, SALT_LEN);
+
+        if (entry->port == my_address->port &&
+            strncmp(entry->ip, my_address->ip, IP_LEN) == 0) {
+            // It's us: keep our network-assigned signature and salt. Take
+            // the lock, as the server thread reads these while answering
+            // requests, and mark them ready so it won't invent new ones.
+            pthread_mutex_lock(&network_lock);
+            memcpy(my_network_signature, entry->signature, SHA256_HASH_SIZE);
+            memcpy(my_network_salt, entry->salt, SALT_LEN);
+            my_network_ready = 1;
+            pthread_mutex_unlock(&network_lock);
+            free(entry);
+        } else if (add_peer_if_new(entry) == 0) {
+            free(entry);  // already known
+        }
+    }
+
+    // The peer we registered with isn't in its own list, so add it ourselves
+    Address_t* contacted = malloc(sizeof(Address_t));
+    memset(contacted, 0, sizeof(Address_t));
+    memcpy(contacted->ip, peer_address.ip, IP_LEN);
+    contacted->port = peer_address.port;
+    if (add_peer_if_new(contacted) == 0) {
+        free(contacted);
+    }
+
+    // Debug: show the network we now know about
+    pthread_mutex_lock(&network_lock);
+    for (uint32_t i = 0; i < peer_count; i++) {
+        printf("Peer %u: %s:%u\n", i, network[i]->ip, network[i]->port);
+    }
+    pthread_mutex_unlock(&network_lock);
+}
+
+/*
+ * Handle the body of a successful retrieve reply: check the block hash and
+ * write the data to a file named after the request.
+ */
+static void handle_retrieve_reply(ReplyHeader_t* header,
+    char* body, uint32_t length, char* request_body, int request_length)
+{
+    hashdata_t check;
+    get_data_sha(body, check, length, SHA256_HASH_SIZE);
+    if (memcmp(check, header->block_hash, SHA256_HASH_SIZE) != 0) {
+        printf("Error: block hash mismatch, file not saved\n");
+        return;
+    }
+
+    // The requested filename is not NUL-terminated, so copy and terminate it
+    char filename[PATH_LEN];
+    memcpy(filename, request_body, request_length);
+    filename[request_length] = '\0';
+
+    FILE* fp = fopen(filename, "wb");
+    if (fp == NULL) {
+        printf("Error: could not create %s\n", filename);
+        return;
+    }
+    fwrite(body, 1, length, fp);
+    fclose(fp);
+    printf("Saved %u bytes to %s\n", length, filename);
+}
+
+/*
+ * Send a request message to another peer on the network. Unless this is
+ * specifically an 'inform' message as described in the assignment handout, a
  * reply will always be expected.
  */
-void send_message(Address_t peer_address, int command, 
+void send_message(Address_t peer_address, int command,
     char* request_body, int body_length)
 {
-    fprintf(stdout, "Connecting to server at %s:%d to run command %d\n", 
+    fprintf(stdout, "Connecting to server at %s:%d to run command %d\n",
         peer_address.ip, peer_address.port, command);
 
     compsys_helper_state_t state;
     char msg_buf[MAX_MSG_LEN];
-    FILE* fp;
 
     // Setup connection. Note that we need to convert our port from an integer
     // to a string
@@ -87,7 +176,7 @@ void send_message(Address_t peer_address, int command,
     request_header.port = htonl(my_address->port);
     request_header.command = htonl(command);
     request_header.length = htonl(body_length);
-    // Copy the header and body together to the message buffer, then write to 
+    // Copy the header and body together to the message buffer, then write to
     // the socket
     memcpy(msg_buf, &request_header, REQUEST_HEADER_LEN);
     memcpy(msg_buf+REQUEST_HEADER_LEN, request_body, body_length);
@@ -98,75 +187,36 @@ void send_message(Address_t peer_address, int command,
         close(peer_socket);
         return;
     }
- 
+
+    // Read the fixed-size reply header, converting numbers to host order
     ReplyHeader_t reply_header;
     compsys_helper_readnb(&state, &reply_header, REPLY_HEADER_LEN);
-    
-    uint32_t reply_length = ntohl(reply_header.length);
-    uint32_t reply_status = ntohl(reply_header.status);
-    uint32_t reply_block = ntohl(reply_header.this_block);
+
+    uint32_t reply_length      = ntohl(reply_header.length);
+    uint32_t reply_status      = ntohl(reply_header.status);
+    uint32_t reply_block       = ntohl(reply_header.this_block);
     uint32_t reply_block_count = ntohl(reply_header.block_count);
-    
-    printf("Got reply: Status %u, length %u, block %u of %u\n", reply_status, reply_length, reply_block, reply_block_count);
-    
+
+    printf("Got reply: Status %u, length %u, block %u of %u\n",
+        reply_status, reply_length, reply_block, reply_block_count);
+
+    // Read the reply body, refusing anything that can't fit in one message
     char reply_body[MAX_MSG_LEN];
-    
-    if (reply_length > MAX_MSG_LEN - REPLY_HEADER_LEN){
-      printf("Error: reply body too long (%u bytes)\n", reply_length);
-      close(peer_socket);
-      return;
+    if (reply_length > MAX_MSG_LEN - REPLY_HEADER_LEN) {
+        printf("Error: reply body too long (%u bytes)\n", reply_length);
+        close(peer_socket);
+        return;
     }
     compsys_helper_readnb(&state, reply_body, reply_length);
 
     if (reply_status >= 3) {
-      // Error replies carry a text message (not NUL-terminated)
-      printf("Error from peer: %.*s\n", (int)reply_length, reply_body);
+        // Error replies carry a text message (not NUL-terminated)
+        printf("Error from peer: %.*s\n", (int)reply_length, reply_body);
     } else if (command == COMMAND_REGISTER) {
-      // Body is a list of 68-byte entries: ip(16) port(4) sig(32) salt(16)
-      uint32_t count = reply_length / PEER_ADDR_LEN;
-
-      for (uint32_t i = 0; i < count; i++) {
-        char* p = reply_body + i * PEER_ADDR_LEN;
-
-        Address_t* entry = malloc(sizeof(Address_t));
-        memcpy(entry->ip,        p + 0,  IP_LEN);
-        memcpy(&entry->port,     p + 16, 4);
-        entry->port = ntohl(entry->port);
-        memcpy(entry->signature, p + 20, SHA256_HASH_SIZE);
-        memcpy(entry->salt,      p + 52, SALT_LEN);
-
-        if (entry->port == my_address->port &&
-            strncmp(entry->ip, my_address->ip, IP_LEN) == 0) {
-          // It's us: keep our network-assigned signature and salt. Take the
-          // lock, as the server thread reads these while answering requests,
-          // and mark them ready so the server won't invent a different one.
-          pthread_mutex_lock(&network_lock);
-          memcpy(my_network_signature, entry->signature, SHA256_HASH_SIZE);
-          memcpy(my_network_salt, entry->salt, SALT_LEN);
-          my_network_ready = 1;
-          pthread_mutex_unlock(&network_lock);
-          free(entry);
-        } else if (add_peer_if_new(entry) == 0) {
-          // Already known
-          free(entry);
-        }
-      }
-
-      // The peer we registered with isn't in its own list, so add it ourselves
-      Address_t* contacted = malloc(sizeof(Address_t));
-      memset(contacted, 0, sizeof(Address_t));
-      memcpy(contacted->ip, peer_address.ip, IP_LEN);
-      contacted->port = peer_address.port;
-      if (add_peer_if_new(contacted) == 0) {
-        free(contacted);
-      }
-
-      // Debug: show the network we now know about
-      pthread_mutex_lock(&network_lock);
-      for (uint32_t i = 0; i < peer_count; i++) {
-        printf("Peer %u: %s:%u\n", i, network[i]->ip, network[i]->port);
-      }
-      pthread_mutex_unlock(&network_lock);
+        handle_register_reply(peer_address, reply_body, reply_length);
+    } else if (command == COMMAND_RETREIVE) {
+        handle_retrieve_reply(&reply_header, reply_body, reply_length,
+            request_body, body_length);
     }
 
     close(peer_socket);
@@ -238,6 +288,7 @@ void inform_other_peers(Address_t *new_peer)
  */ 
 void* client_thread()
 {
+    srand(time(NULL));
     char peer_ip[IP_LEN];
     fprintf(stdout, "Enter peer IP to connect to: ");
     scanf("%16s", peer_ip);
@@ -262,13 +313,34 @@ void* client_thread()
     memcpy(peer_address.ip, peer_ip, IP_LEN);
     peer_address.port = atoi(peer_port);
 
-    /*
-    2: Sending a first register message
-    Here you should probably send a first register message using the 
-    send_message function.
-    */
-    send_message(peer_address,COMMAND_REGISTER,NULL, 0);
-    // You should never see this printed in your finished implementation
+    // Join the network via the given peer
+    send_message(peer_address, COMMAND_REGISTER, NULL, 0);
+
+    // Repeatedly ask for a file and request it from a random other peer
+    while (1) {
+        char filename[PATH_LEN];
+        printf("Type the name of the file to retrieve, or 'quit': ");
+        scanf("%127s", filename);
+
+        if (strcmp(filename, "quit") == 0) {
+            break;
+        }
+
+        // Copy a random peer that isn't us (we are network[0]) while holding
+        // the lock, so we never hold it during network I/O
+        pthread_mutex_lock(&network_lock);
+        if (peer_count < 2) {
+            pthread_mutex_unlock(&network_lock);
+            printf("No other peers to ask\n");
+            continue;
+        }
+        uint32_t i = 1 + rand() % (peer_count - 1);
+        Address_t target = *network[i];
+        pthread_mutex_unlock(&network_lock);
+
+        send_message(target, COMMAND_RETREIVE, filename, strlen(filename));
+    }
+
     printf("Client thread done\n");
 
     return NULL;
@@ -456,8 +528,6 @@ static int send_file_blocks(int connfd, FILE *file)
     return 1;
 }
 
-
-
 /*
  * Handler for all server requests. This will call the relevent function based 
  * on the parsed command code
@@ -471,14 +541,11 @@ void* handle_server_request_thread(void *vargp)
     int connfd = *((int *)vargp);
     pthread_detach(pthread_self());
     free(vargp);
-
     /*
     5: Reading Server Requests
     */
-
     // Initialize the provided reading helper
     compsys_helper_readinitb(&state, connfd);
-
     // Read the request header
     ssize_t bytes_read = compsys_helper_readnb(
         &state, buf, REQUEST_HEADER_LEN
@@ -489,7 +556,6 @@ void* handle_server_request_thread(void *vargp)
         close(connfd);
         return NULL;
     }
-
     // Copy the received bytes into the provided struct
     RequestHeader_t header;
     memcpy(&header, buf, REQUEST_HEADER_LEN);
@@ -505,7 +571,6 @@ void* handle_server_request_thread(void *vargp)
     printf("Port: %u\n", port);
     printf("Command: %u\n", command);
     printf("Body length: %u\n", body_length);
-
 
     // Check that the body is not too large
     if (body_length > MAX_MSG_LEN - REQUEST_HEADER_LEN) {
