@@ -356,7 +356,7 @@ void* client_thread()
     srand(time(NULL));
     char peer_ip[IP_LEN];
     fprintf(stdout, "Enter peer IP to connect to: ");
-    scanf("%16s", peer_ip);
+    scanf("%15s", peer_ip);
 
     // Clean up password string as otherwise some extra chars can sneak in.
     for (int i=strlen(peer_ip); i<IP_LEN; i++)
@@ -366,7 +366,7 @@ void* client_thread()
 
     char peer_port[PORT_STR_LEN];
     fprintf(stdout, "Enter peer port to connect to: ");
-    scanf("%16s", peer_port);
+    scanf("%7s", peer_port);
 
     // Clean up password string as otherwise some extra chars can sneak in.
     for (int i=strlen(peer_port); i<PORT_STR_LEN; i++)
@@ -1091,7 +1091,7 @@ int main(int argc, char **argv)
 
     char password[PASSWORD_LEN];
     fprintf(stdout, "Create a password to proceed: ");
-    scanf("%16s", password);
+    scanf("%15s", password);
 
     // Clean up password string as otherwise some extra chars can sneak in.
     for (int i=strlen(password); i<PASSWORD_LEN; i++)
