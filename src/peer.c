@@ -359,34 +359,53 @@ void* client_thread()
 {
     srand(time(NULL));
     char peer_ip[IP_LEN];
-    fprintf(stdout, "Enter peer IP to connect to: ");
+    fprintf(stdout, "Enter peer IP to connect to (or '0' to start a new network): ");
     scanf("%15s", peer_ip);
 
-    // Clean up password string as otherwise some extra chars can sneak in.
-    for (int i=strlen(peer_ip); i<IP_LEN; i++)
+    // Clean up IP string as otherwise some extra chars can sneak in.
+    for (size_t i = strlen(peer_ip); i < IP_LEN; i++)
     {
         peer_ip[i] = '\0';
     }
 
-    char peer_port[PORT_STR_LEN];
-    fprintf(stdout, "Enter peer port to connect to: ");
-    scanf("%7s", peer_port);
+    if (strcmp(peer_ip, "0") == 0) {
+        printf("Waiting for connection...\n");
 
-    // Clean up password string as otherwise some extra chars can sneak in.
-    for (int i=strlen(peer_port); i<PORT_STR_LEN; i++)
-    {
-        peer_port[i] = '\0';
-    }
+        while (1) {
+            pthread_mutex_lock(&network_lock);
+            int ready = (peer_count >= 2 && my_network_ready);
+            pthread_mutex_unlock(&network_lock);
 
-    Address_t peer_address;
-    memcpy(peer_address.ip, peer_ip, IP_LEN);
-    peer_address.port = atoi(peer_port);
-    if(!is_valid_port(peer_address.port)) {
-      printf("Invalid port, not registered\n");
+            if (ready) {
+                break;
+            }
+            sleep(1);
+        }
+
+        printf("Another peer has joined the network!\n");
     } else {
-      send_message(peer_address, COMMAND_REGISTER, NULL, 0);
+        char peer_port[PORT_STR_LEN];
+        fprintf(stdout, "Enter peer port to connect to: ");
+        scanf("%7s", peer_port);
+
+        // Clean up port string as otherwise some extra chars can sneak in.
+        for (size_t i = strlen(peer_port); i < PORT_STR_LEN; i++)
+        {
+            peer_port[i] = '\0';
+        }
+
+        Address_t peer_address;
+        memcpy(peer_address.ip, peer_ip, IP_LEN);
+        peer_address.port = atoi(peer_port);
+
+        if (peer_address.port <= 0 || !is_valid_port(peer_address.port)) {
+            printf("Invalid port, not registered\n");
+        } else {
+            // Join the network via the given peer
+            send_message(peer_address, COMMAND_REGISTER, NULL, 0);
+        }
     }
-    // Join the network via the given peer
+
     // Repeatedly ask for a file and request it from a random other peer
     while (1) {
         char filename[PATH_LEN];
