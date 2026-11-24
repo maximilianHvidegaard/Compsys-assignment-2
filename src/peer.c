@@ -232,6 +232,10 @@ void send_message(Address_t peer_address, int command,
     port_char[5] = '\0';
     sprintf(port_char, "%d", peer_address.port);
     int peer_socket = compsys_helper_open_clientfd(peer_address.ip, port_char);
+    if (peer_socket < 0) {
+      printf("Error could not connect to %s:%u\n", peer_address.ip, peer_address.port);
+      return;
+    }
     compsys_helper_readinitb(&state, peer_socket);
 
     // Construct a request message and send it to the peer
