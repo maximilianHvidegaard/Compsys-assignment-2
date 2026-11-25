@@ -32,6 +32,9 @@ Address_t** network = NULL;
 uint32_t peer_count = 0;
 pthread_mutex_t network_lock = PTHREAD_MUTEX_INITIALIZER;
 
+// Largest reply body that fits in one message (8196 - 80 = 8116 bytes)
+#define BLOCK_BODY_LEN (MAX_MSG_LEN - REPLY_HEADER_LEN)
+
 /*
  * Add a peer to the network unless its ip+port is already known.
  * Returns 1 if added, 0 if it was a duplicate. Thread-safe.
@@ -184,32 +187,146 @@ static void handle_register_reply(Address_t peer_address,
 }
 
 /*
- * Handle the body of a successful retrieve reply: check the block hash and
- * write the data to a file named after the request.
+ * Read one reply (header + body) from the connection. The header's numbers
+ * are converted to host byte order in place. Returns 1 on success, or 0 if
+ * the connection closed early or the body would not fit in one message.
  */
-static void handle_retrieve_reply(ReplyHeader_t* header,
-    char* body, uint32_t length, char* request_body, int request_length)
+static int read_reply(compsys_helper_state_t* state,
+    ReplyHeader_t* header, char* body)
 {
-    hashdata_t check;
-    get_data_sha(body, check, length, SHA256_HASH_SIZE);
-    if (memcmp(check, header->block_hash, SHA256_HASH_SIZE) != 0) {
-        printf("Error: block hash mismatch, file not saved\n");
+    if (compsys_helper_readnb(state, header, REPLY_HEADER_LEN)
+        != REPLY_HEADER_LEN) {
+        printf("Error: connection closed before a full reply header\n");
+        return 0;
+    }
+    header->length      = ntohl(header->length);
+    header->status      = ntohl(header->status);
+    header->this_block  = ntohl(header->this_block);
+    header->block_count = ntohl(header->block_count);
+
+    if (header->length > BLOCK_BODY_LEN) {
+        printf("Error: reply body too long (%u bytes)\n", header->length);
+        return 0;
+    }
+    if (compsys_helper_readnb(state, body, header->length)
+        != (ssize_t)header->length) {
+        printf("Error: connection closed before a full reply body\n");
+        return 0;
+    }
+    return 1;
+}
+
+/*
+ * Receive a file that may be split over several blocks, starting from the
+ * first block already read. Blocks can arrive in any order: each one is
+ * checked against its block hash and copied to offset this_block * 8116 in
+ * one buffer. When all have arrived, the whole buffer is checked against the
+ * total hash and written to a file named after the request.
+ */
+static void receive_file(compsys_helper_state_t* state,
+    ReplyHeader_t* first, char* first_body,
+    char* request_body, int request_length)
+{
+    uint32_t count = first->block_count;
+    if (count == 0) {
+        printf("Error: reply says the file has 0 blocks\n");
         return;
     }
 
-    // The requested filename is not NUL-terminated, so copy and terminate it
-    char filename[PATH_LEN];
-    memcpy(filename, request_body, request_length);
-    filename[request_length] = '\0';
-
-    FILE* fp = fopen(filename, "wb");
-    if (fp == NULL) {
-        printf("Error: could not create %s\n", filename);
+    char* data = malloc((size_t)count * BLOCK_BODY_LEN);
+    char* got  = calloc(count, 1);  // got[i] = 1 once block i has arrived
+    if (data == NULL || got == NULL) {
+        printf("Error: not enough memory for %u blocks\n", count);
+        free(data);
+        free(got);
         return;
     }
-    fwrite(body, 1, length, fp);
-    fclose(fp);
-    printf("Saved %u bytes to %s\n", length, filename);
+
+    ReplyHeader_t header = *first;
+    char body[BLOCK_BODY_LEN];
+    memcpy(body, first_body, first->length);
+
+    uint32_t received = 0;
+    size_t total_length = 0;
+    int ok = 1;
+
+    while (1) {
+        // Check the block belongs to this transfer and isn't a repeat
+        if (header.status != STATUS_OK ||
+            header.block_count != count ||
+            header.this_block >= count ||
+            got[header.this_block]) {
+            printf("Error: unexpected block %u of %u (status %u)\n",
+                header.this_block, header.block_count, header.status);
+            ok = 0;
+            break;
+        }
+        // Every block except the last must be full, or offsets won't line up
+        if (header.this_block < count - 1 && header.length != BLOCK_BODY_LEN) {
+            printf("Error: block %u is only %u bytes\n",
+                header.this_block, header.length);
+            ok = 0;
+            break;
+        }
+
+        // Check this block's data against its hash
+        hashdata_t check;
+        get_data_sha(body, check, header.length, SHA256_HASH_SIZE);
+        if (memcmp(check, header.block_hash, SHA256_HASH_SIZE) != 0) {
+            printf("Error: hash mismatch in block %u\n", header.this_block);
+            ok = 0;
+            break;
+        }
+
+        // Put the block in its place
+        memcpy(data + (size_t)header.this_block * BLOCK_BODY_LEN,
+            body, header.length);
+        got[header.this_block] = 1;
+        received++;
+        total_length += header.length;
+
+        if (received == count) {
+            break;
+        }
+
+        // More to come on the same connection
+        if (!read_reply(state, &header, body)) {
+            ok = 0;
+            break;
+        }
+    }
+
+    // Check the whole file against the total hash
+    if (ok) {
+        hashdata_t check;
+        get_data_sha(data, check, total_length, SHA256_HASH_SIZE);
+        if (memcmp(check, first->total_hash, SHA256_HASH_SIZE) != 0) {
+            printf("Error: total hash mismatch, file not saved\n");
+            ok = 0;
+        }
+    }
+
+    if (ok) {
+        // The requested filename is not NUL-terminated, so copy and end it
+        char filename[PATH_LEN];
+        memcpy(filename, request_body, request_length);
+        filename[request_length] = '\0';
+
+        FILE* fp = fopen(filename, "wb");
+        if (fp == NULL) {
+            printf("Error: could not create %s\n", filename);
+        } else {
+            fwrite(data, 1, total_length, fp);
+            fclose(fp);
+            printf("Saved %zu bytes (%u blocks) to %s\n",
+                total_length, count, filename);
+        }
+    } else {
+        printf("File not saved (%u of %u blocks received)\n", received, count);
+    }
+
+    free(data);
+    free(got);
 }
 
 /*
@@ -257,26 +374,19 @@ void send_message(Address_t peer_address, int command,
         return;
     }
 
-    // Read the fixed-size reply header, converting numbers to host order
+    // Read the first reply; a retrieve may be followed by more blocks
     ReplyHeader_t reply_header;
-    compsys_helper_readnb(&state, &reply_header, REPLY_HEADER_LEN);
-
-    uint32_t reply_length      = ntohl(reply_header.length);
-    uint32_t reply_status      = ntohl(reply_header.status);
-    uint32_t reply_block       = ntohl(reply_header.this_block);
-    uint32_t reply_block_count = ntohl(reply_header.block_count);
-
-    printf("Got reply: Status %u, length %u, block %u of %u\n",
-        reply_status, reply_length, reply_block, reply_block_count);
-
-    // Read the reply body, refusing anything that can't fit in one message
-    char reply_body[MAX_MSG_LEN];
-    if (reply_length > MAX_MSG_LEN - REPLY_HEADER_LEN) {
-        printf("Error: reply body too long (%u bytes)\n", reply_length);
+    char reply_body[BLOCK_BODY_LEN];
+    if (!read_reply(&state, &reply_header, reply_body)) {
         close(peer_socket);
         return;
     }
-    compsys_helper_readnb(&state, reply_body, reply_length);
+    uint32_t reply_length = reply_header.length;
+    uint32_t reply_status = reply_header.status;
+
+    printf("Got reply: Status %u, length %u, block %u of %u\n",
+        reply_status, reply_length,
+        reply_header.this_block, reply_header.block_count);
 
     if (reply_status >= 3) {
         // Error replies carry a text message (not NUL-terminated)
@@ -284,7 +394,7 @@ void send_message(Address_t peer_address, int command,
     } else if (command == COMMAND_REGISTER) {
         handle_register_reply(peer_address, reply_body, reply_length);
     } else if (command == COMMAND_RETREIVE) {
-        handle_retrieve_reply(&reply_header, reply_body, reply_length,
+        receive_file(&state, &reply_header, reply_body,
             request_body, body_length);
     }
 
@@ -410,7 +520,9 @@ void* client_thread()
     while (1) {
         char filename[PATH_LEN];
         printf("Type the name of the file to retrieve, or 'quit': ");
-        scanf("%127s", filename);
+        if (scanf("%127s", filename) != 1) {
+          break;
+        }
 
         if (strcmp(filename, "quit") == 0) {
             break;
@@ -482,8 +594,6 @@ int send_one_block_reply(int connfd, uint32_t status,
 
     return 1;
 }
-
-
 
 static uint32_t check_peer_signature(const RequestHeader_t *header)
 {
